@@ -17,7 +17,7 @@ type Worker struct {
 func NewWorker(id int) *Worker {
 	return &Worker{
 		id:       id,
-		jobQueue: make(chan string, 5), // Буферизованный канал для заданий
+		jobQueue: make(chan string, 5),
 		quit:     make(chan struct{}),
 	}
 }
@@ -30,8 +30,7 @@ func (w *Worker) Start(wg *sync.WaitGroup, results chan<- string) {
 		for {
 			select {
 			case job := <-w.jobQueue:
-				// Симуляция обработки задания
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(200 * time.Millisecond)
 				fmt.Printf("Worker %d processing job: %s\n", w.id, job)
 				results <- fmt.Sprintf("Worker %d processed: %s", w.id, job)
 			case <-w.quit:
@@ -47,30 +46,35 @@ func (w *Worker) Stop() {
 	close(w.quit)
 }
 
-// WorkerPool структура
+// WorkerPool структура с round-robin распределением
 type WorkerPool struct {
-	workers      map[int]*Worker
-	jobChannel   chan string
-	results      chan string
-	wg           sync.WaitGroup
-	addWorker    chan bool
-	removeWorker chan bool
-	workerID     int
-	mu           sync.RWMutex
-	running      bool
-	stopChan     chan struct{}
+	workers           map[int]*Worker
+	workerIDs         []int
+	lastWorkerIndex   int
+	jobChannel        chan string
+	results           chan string
+	wg                sync.WaitGroup
+	addWorker         chan bool
+	removeWorker      chan bool
+	workerID          int
+	mu                sync.RWMutex
+	running           bool
+	stopChan          chan struct{}
+	distributionMutex sync.Mutex
 }
 
 // Создание нового пула
 func NewWorkerPool() *WorkerPool {
 	return &WorkerPool{
-		workers:      make(map[int]*Worker),
-		jobChannel:   make(chan string, 100),
-		results:      make(chan string, 100),
-		addWorker:    make(chan bool, 10), // Буферизованный канал
-		removeWorker: make(chan bool, 10), // Буферизованный канал
-		stopChan:     make(chan struct{}),
-		running:      false,
+		workers:         make(map[int]*Worker),
+		workerIDs:       make([]int, 0),
+		lastWorkerIndex: -1,
+		jobChannel:      make(chan string, 100),
+		results:         make(chan string, 100),
+		addWorker:       make(chan bool, 10),
+		removeWorker:    make(chan bool, 10),
+		stopChan:        make(chan struct{}),
+		running:         false,
 	}
 }
 
@@ -88,7 +92,7 @@ func (wp *WorkerPool) Start() {
 		for {
 			select {
 			case job := <-wp.jobChannel:
-				wp.distributeJob(job)
+				wp.distributeJobRoundRobin(job)
 			case <-wp.addWorker:
 				wp.addNewWorker()
 			case <-wp.removeWorker:
@@ -100,41 +104,59 @@ func (wp *WorkerPool) Start() {
 	}()
 }
 
-// Распределение задания между воркерами
-func (wp *WorkerPool) distributeJob(job string) {
-	wp.mu.RLock()
-	defer wp.mu.RUnlock()
+// Round-robin распределение заданий
+func (wp *WorkerPool) distributeJobRoundRobin(job string) {
+	wp.distributionMutex.Lock()
+	defer wp.distributionMutex.Unlock()
 
-	if len(wp.workers) == 0 {
-		// Если нет воркеров, возвращаем задание в очередь
+	wp.mu.RLock()
+	workerCount := len(wp.workerIDs)
+	wp.mu.RUnlock()
+
+	if workerCount == 0 {
 		go func() {
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			select {
 			case wp.jobChannel <- job:
 			default:
-				fmt.Printf("Failed to requeue job: %s\n", job)
+				fmt.Printf("Failed to requeue job: %s (no workers available)\n", job)
 			}
 		}()
 		return
 	}
 
-	// Пробуем отправить задание любому доступному воркеру
-	for _, worker := range wp.workers {
+	for attempts := 0; attempts < workerCount; attempts++ {
+		wp.mu.RLock()
+		if len(wp.workerIDs) == 0 {
+			wp.mu.RUnlock()
+			return
+		}
+
+		wp.lastWorkerIndex = (wp.lastWorkerIndex + 1) % len(wp.workerIDs)
+		workerID := wp.workerIDs[wp.lastWorkerIndex]
+		worker, exists := wp.workers[workerID]
+		wp.mu.RUnlock()
+
+		if !exists {
+			continue
+		}
+
 		select {
 		case worker.jobQueue <- job:
-			return // Задание успешно отправлено
+			fmt.Printf("Job '%s' assigned to Worker %d (round-robin)\n", job, workerID)
+			return
 		default:
-			continue // Воркер занят, пробуем следующего
+			continue
 		}
 	}
 
-	// Если все воркеры заняты, ждем и повторяем попытку
 	go func() {
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		select {
 		case wp.jobChannel <- job:
+			fmt.Printf("Job '%s' requeued (all workers busy)\n", job)
 		default:
-			fmt.Printf("Failed to requeue job: %s\n", job)
+			fmt.Printf("Failed to requeue job: %s (queue full)\n", job)
 		}
 	}()
 }
@@ -148,6 +170,8 @@ func (wp *WorkerPool) addNewWorker() {
 	worker := NewWorker(wp.workerID)
 	worker.Start(&wp.wg, wp.results)
 	wp.workers[wp.workerID] = worker
+	wp.workerIDs = append(wp.workerIDs, wp.workerID)
+
 	fmt.Printf("Added worker %d (total: %d)\n", wp.workerID, len(wp.workers))
 }
 
@@ -161,34 +185,37 @@ func (wp *WorkerPool) removeExistingWorker() {
 		return
 	}
 
-	// Находим воркера с наибольшим ID для удаления
-	maxID := 0
-	for id := range wp.workers {
-		if id > maxID {
-			maxID = id
-		}
-	}
+	lastID := wp.workerIDs[len(wp.workerIDs)-1]
 
-	if worker, exists := wp.workers[maxID]; exists {
+	if worker, exists := wp.workers[lastID]; exists {
 		worker.Stop()
-		delete(wp.workers, maxID)
-		fmt.Printf("Removed worker %d (total: %d)\n", maxID, len(wp.workers))
+		delete(wp.workers, lastID)
+
+		wp.workerIDs = wp.workerIDs[:len(wp.workerIDs)-1]
+
+		if wp.lastWorkerIndex >= len(wp.workerIDs) && len(wp.workerIDs) > 0 {
+			wp.lastWorkerIndex = len(wp.workerIDs) - 1
+		}
+
+		fmt.Printf("Removed worker %d (total: %d)\n", lastID, len(wp.workers))
 	}
 }
 
-// Добавить воркера
+// Добавить воркера с ожиданием
 func (wp *WorkerPool) AddWorker() {
 	select {
 	case wp.addWorker <- true:
+		time.Sleep(50 * time.Millisecond)
 	default:
 		fmt.Println("Failed to add worker - channel full")
 	}
 }
 
-// Удалить воркера
+// Удалить воркера с ожиданием
 func (wp *WorkerPool) RemoveWorker() {
 	select {
 	case wp.removeWorker <- true:
+		time.Sleep(50 * time.Millisecond)
 	default:
 		fmt.Println("Failed to remove worker - channel full")
 	}
@@ -216,6 +243,18 @@ func (wp *WorkerPool) WorkerCount() int {
 	return len(wp.workers)
 }
 
+// Получить статистику распределения
+func (wp *WorkerPool) GetDistributionStats() map[int]int {
+	wp.mu.RLock()
+	defer wp.mu.RUnlock()
+
+	stats := make(map[int]int)
+	for _, id := range wp.workerIDs {
+		stats[id] = 0
+	}
+	return stats
+}
+
 // Остановить пул и дождаться завершения всех воркеров
 func (wp *WorkerPool) Stop() {
 	wp.mu.Lock()
@@ -225,19 +264,15 @@ func (wp *WorkerPool) Stop() {
 	}
 	wp.running = false
 
-	// Останавливаем все воркеры
 	for _, worker := range wp.workers {
 		worker.Stop()
 	}
 	wp.mu.Unlock()
 
-	// Останавливаем главную горутину пула
 	close(wp.stopChan)
 
-	// Ждем завершения всех воркеров
 	wp.wg.Wait()
 
-	// Закрываем канал результатов
 	close(wp.results)
 	fmt.Println("WorkerPool stopped")
 }
@@ -246,7 +281,6 @@ func main() {
 	pool := NewWorkerPool()
 	pool.Start()
 
-	// Даем время пулу запуститься
 	time.Sleep(100 * time.Millisecond)
 
 	fmt.Println("=== Создание воркеров ===")
@@ -254,11 +288,8 @@ func main() {
 	pool.AddWorker()
 	pool.AddWorker()
 
-	// Даем время воркерам запуститься
-	time.Sleep(200 * time.Millisecond)
 	fmt.Printf("Active workers: %d\n", pool.WorkerCount())
 
-	// Запускаем обработчик результатов
 	resultsDone := make(chan bool)
 	go func() {
 		defer close(resultsDone)
@@ -267,39 +298,34 @@ func main() {
 		}
 	}()
 
-	fmt.Println("\n=== Отправка заданий ===")
-	jobs := []string{"job1", "job2", "job3", "job4", "job5"}
+	fmt.Println("\n=== Отправка заданий (round-robin) ===")
+	jobs := []string{"job1", "job2", "job3", "job4", "job5", "job6"}
 	for _, job := range jobs {
 		pool.SubmitJob(job)
-		time.Sleep(10 * time.Millisecond) // Небольшая задержка между заданиями
+		time.Sleep(50 * time.Millisecond)
 	}
 
-	// Ждем обработки первой партии заданий
-	time.Sleep(2 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	fmt.Println("\n=== Динамическое управление воркерами ===")
 	pool.AddWorker()
 	fmt.Printf("Active workers after adding: %d\n", pool.WorkerCount())
 
-	time.Sleep(1 * time.Second)
-
 	pool.RemoveWorker()
 	fmt.Printf("Active workers after removing: %d\n", pool.WorkerCount())
 
-	// Отправляем дополнительные задания
 	fmt.Println("\n=== Дополнительные задания ===")
-	moreJobs := []string{"job6", "job7", "job8"}
+	moreJobs := []string{"job7", "job8", "job9"}
 	for _, job := range moreJobs {
 		pool.SubmitJob(job)
+		time.Sleep(30 * time.Millisecond)
 	}
 
-	// Ждем завершения всех заданий
-	time.Sleep(3 * time.Second)
+	time.Sleep(4 * time.Second)
 
 	fmt.Println("\n=== Завершение работы ===")
 	pool.Stop()
 
-	// Ждем завершения обработчика результатов
 	<-resultsDone
 	fmt.Println("Program completed")
 }
